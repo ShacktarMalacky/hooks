@@ -59,6 +59,45 @@ Mientras el secret no exista, el workflow termina sin error ni efecto.
 Si algún efecto secundario de Slack falla (por ejemplo, falta un scope), el
 issue ya creado no se pierde: el script registra un aviso y continúa.
 
+## Notion → GitHub issues
+
+Cada 30 minutos, [.github/workflows/notion-to-issues.yml](.github/workflows/notion-to-issues.yml)
+sincroniza una base de datos de Notion con los issues del repo (todo gratis:
+el repo es público, así que Actions es ilimitado, y el token interno de Notion
+es gratuito).
+
+### Cómo funciona
+
+- Una fila nueva con estado "Reportar" se convierte en un issue (etiqueta
+  `notion`), con un marcador oculto `[notion-row:<id>]` para deduplicar.
+- La fila pasa a estado "En GitHub" y guarda la URL del issue en su propiedad
+  `Issue`, lo que además evita recrearlo nunca.
+- Cuando el issue se cierra en GitHub, la fila pasa a estado "Hecho" en la
+  siguiente ejecución.
+
+### Puesta en marcha (una vez)
+
+1. Crea un token de Notion interno: https://www.notion.so/profile/integrations
+   (Crear integración → copiar el *Internal Integration Secret*).
+2. En la base de datos de Notion: `···` → *Connections* → conectar tu integración.
+3. Guarda el token como secret del repo: `gh s set NOTION_TOKEN -R ShacktarMalacky/hooks`
+   (o *Settings → Secrets and variables → Actions*).
+4. Crea una base de datos titulada **Bugs** con una propiedad de estado
+   "Estado" y una de texto "Issue".
+5. Ejecuta el workflow manualmente para probar.
+
+Mientras no exista el secret, el workflow termina sin error ni efecto.
+
+### Configuración (en el workflow)
+
+| Variable | Valor actual |
+|---|---|
+| `NOTION_DATABASE_TITLE` | `Bugs` |
+| `NOTION_STATUS_PROP` | `Estado` |
+| `NOTION_STATUS_NEW` / `TRIAGE` / `DONE` | `Reportar` / `En GitHub` / `Hecho` |
+| `NOTION_ISSUE_PROP` | `Issue` |
+| `ISSUE_LABELS` | `notion` |
+
 ## Desarrollo
 
 ```bash
