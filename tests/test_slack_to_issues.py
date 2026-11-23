@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import sys
@@ -77,8 +78,10 @@ class CheckpointTests(unittest.TestCase):
 class MainFlowTests(unittest.TestCase):
     def test_creates_issue_and_checkpoint(self):
         checkpoint = os.path.join(os.path.dirname(__file__), "tmp_ckpt_flow.json")
-        if os.path.exists(checkpoint):
-            os.remove(checkpoint)
+        threads = os.path.join(os.path.dirname(__file__), "tmp_threads_flow.json")
+        for path in (checkpoint, threads):
+            if os.path.exists(path):
+                os.remove(path)
         messages = {
             "ok": True,
             "messages": [
@@ -96,15 +99,33 @@ class MainFlowTests(unittest.TestCase):
                 "SLACK_CHANNEL_ID": "C1",
                 "CHECKPOINT_FILE": checkpoint,
                 "ISSUE_LABELS": "slack",
+                "THREADS_FILE": threads,
             },
         ):
-            with mock.patch.object(s2i, "slack_get", return_value=messages), mock.patch.object(
-                s2i, "resolve_author", return_value="Ana"
-            ), mock.patch.object(s2i, "issue_exists", return_value=False), mock.patch.object(
-                s2i,
-                "create_issue",
-                return_value={"html_url": "https://github.com/o/r/issues/1"},
-            ) as create:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(s2i, "slack_get", return_value=messages)
+                )
+                stack.enter_context(
+                    mock.patch.object(s2i, "resolve_author", return_value="Ana")
+                )
+                stack.enter_context(
+                    mock.patch.object(s2i, "issue_exists", return_value=False)
+                )
+                create = stack.enter_context(
+                    mock.patch.object(
+                        s2i,
+                        "create_issue",
+                        return_value={"html_url": "https://github.com/o/r/issues/1", "number": 1},
+                    )
+                )
+                stack.enter_context(mock.patch.object(s2i, "notify_issue_created"))
+                stack.enter_context(
+                    mock.patch.object(s2i, "sync_thread_replies", return_value=False)
+                )
+                stack.enter_context(
+                    mock.patch.object(s2i, "sync_issue_comments", return_value=False)
+                )
                 code = s2i.main()
         self.assertEqual(code, 0)
         self.assertEqual(create.call_count, 2)
@@ -112,6 +133,7 @@ class MainFlowTests(unittest.TestCase):
             state = json.load(handle)
         self.assertEqual(state["last_ts"], "1700000005.0")
         os.remove(checkpoint)
+        os.remove(threads)
 
     def test_skips_existing_issues(self):
         checkpoint = os.path.join(os.path.dirname(__file__), "tmp_ckpt_dedup.json")
@@ -136,8 +158,14 @@ class MainFlowTests(unittest.TestCase):
             with mock.patch.object(s2i, "slack_get", return_value=messages), mock.patch.object(
                 s2i, "resolve_author", return_value="A"
             ), mock.patch.object(s2i, "issue_exists", return_value=True), mock.patch.object(
+                s2i, "parse_command", return_value=None
+            ), mock.patch.object(
                 s2i, "create_issue"
-            ) as create:
+            ) as create, mock.patch.object(
+                s2i, "sync_thread_replies", return_value=False
+            ), mock.patch.object(
+                s2i, "sync_issue_comments", return_value=False
+            ):
                 code = s2i.main()
         self.assertEqual(code, 0)
         create.assert_not_called()
