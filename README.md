@@ -69,6 +69,32 @@ Mientras el secret no exista, el workflow termina sin error ni efecto.
 Si algún efecto secundario de Slack falla (por ejemplo, falta un scope), el
 issue ya creado no se pierde: el script registra un aviso y continúa.
 
+## Digest semanal en Slack
+
+Los lunes a las 09:00 UTC, [`.github/workflows/weekly-digest.yml`](.github/workflows/weekly-digest.yml)
+publica en `#general` un resumen de la semana: issues abiertos y cerrados,
+etiquetas más activas y total pendiente. Configurable con `DIGEST_WINDOW_DAYS`;
+se puede lanzar a mano desde *Actions*.
+
+## Anti-spam
+
+El bot de Slack limita por defecto a 5 issues por usuario y hora
+(`SPAM_MAX_PER_HOUR`, 0 lo desactiva). Al superar el límite, responde en el
+hilo y no crea el issue.
+
+## Utilidades
+
+[`scripts/setup_labels.py`](scripts/setup_labels.py) crea las etiquetas
+estándar (`slack`, `notion`, `bug`, `mejora`, `pregunta`, `prioridad:alta`)
+si no existen, con colores y descripciones. Se ejecuta desde Actions
+(Workflow "Utilities", con casillas para elegir qué correr) o a mano con
+`GITHUB_TOKEN`/`GITHUB_REPOSITORY` en el entorno.
+
+[`scripts/healthcheck.py`](scripts/healthcheck.py) diagnostica la instalación:
+validez del token de GitHub, del token de Slack (`auth.test`), del token de
+Notion (`users/me`) y presencia de las etiquetas estándar. Escribe el informe
+también en el resumen del run de Actions (`$GITHUB_STEP_SUMMARY`).
+
 ## Notion → GitHub issues
 
 Cada 30 minutos, [.github/workflows/notion-to-issues.yml](.github/workflows/notion-to-issues.yml)

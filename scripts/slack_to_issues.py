@@ -30,6 +30,7 @@ REACTION_EMOJI = "white_check_mark"
 DEFAULT_SIMILARITY_THRESHOLD = 0.8
 DEFAULT_STALE_DAYS = 30
 DEFAULT_STALE_CLOSE_DAYS = 7
+DEFAULT_SPAM_MAX_PER_HOUR = 5
 CLASSIFY_RULES = [
     ("prioridad:alta", r"urgente|critico|production|no funciona nada|lo antes posible|caida"),
     ("bug", r"\berror\b|excepcion|crash|\bfallo\b|\bbug\b|no funciona|se rompe|explota"),
@@ -245,6 +246,24 @@ def ensure_labels(repo, token, labels):
             )
         except Exception as error:
             print(f"  aviso: no se pudo crear la etiqueta '{label}': {error}")
+
+
+def hour_bucket(now=None):
+    now = now or datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H")
+
+
+def get_spam_counts(state, now=None):
+    bucket = hour_bucket(now)
+    spam = state.setdefault("spam", {})
+    if spam.get("hour") != bucket:
+        spam["hour"] = bucket
+        spam["counts"] = {}
+    return spam.setdefault("counts", {})
+
+
+def spam_allows(counts, author_id, limit):
+    return limit <= 0 or counts.get(author_id, 0) < limit
 
 
 def find_warn_date(comments):
@@ -480,6 +499,10 @@ def main():
         stale_close_days = int(os.environ.get("STALE_CLOSE_DAYS", DEFAULT_STALE_CLOSE_DAYS))
     except ValueError:
         stale_days, stale_close_days = DEFAULT_STALE_DAYS, DEFAULT_STALE_CLOSE_DAYS
+    try:
+        spam_limit = int(os.environ.get("SPAM_MAX_PER_HOUR", DEFAULT_SPAM_MAX_PER_HOUR))
+    except ValueError:
+        spam_limit = DEFAULT_SPAM_MAX_PER_HOUR
 
     state = load_state(state_file)
     oldest = load_checkpoint(checkpoint_file)
@@ -499,6 +522,7 @@ def main():
 
     created = 0
     newest_ts = oldest
+    spam_counts = get_spam_counts(state)
     for message in messages:
         ts = message["ts"]
         text = message["text"]
@@ -530,6 +554,23 @@ def main():
                 except Exception as error:
                     print(f"  aviso: no se pudo comentar el duplicado: {error}")
             else:
+                author_id = message.get("user") or "desconocido"
+                if not spam_allows(spam_counts, author_id, spam_limit):
+                    print(f"- {ts}: límite de {spam_limit} issues/hora para {author_id}")
+                    try:
+                        slack_post(
+                            slack_token,
+                            channel_id,
+                            f":no_entry: Has alcanzado el límite de {spam_limit} reportes "
+                            f"por hora. Prueba de nuevo más tarde.",
+                            thread_ts=ts,
+                        )
+                    except Exception as error:
+                        print(f"  aviso: no se pudo avisar por Slack: {error}")
+                    newest_ts = ts
+                    continue
+                spam_counts[author_id] = spam_counts.get(author_id, 0) + 1
+                changed = True
                 title = make_title(text)
                 body = format_issue_body(message, author, channel_id, channel_name)
                 issue_labels = labels + [label for label in classify(text) if label not in labels]
