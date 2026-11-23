@@ -1,0 +1,44 @@
+name: Slack to GitHub issues
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: slack-to-issues
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync Slack messages to GitHub issues
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: C0AV06CL03G
+          SLACK_CHANNEL_NAME: general
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECKPOINT_FILE: .slack-state/checkpoint.json
+          ISSUE_LABELS: slack
+        run: python scripts/slack_to_issues.py
+
+      - name: Commit checkpoint
+        run: |
+          git config user.name "slack-to-issues[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -n "$(git status --porcelain .slack-state)" ]; then
+            git add .slack-state/checkpoint.json
+            git commit -m "chore(slack): update checkpoint $(date -u +%FT%TZ)"
+            git push
+          fi

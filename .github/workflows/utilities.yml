@@ -1,0 +1,46 @@
+name: Utilities
+
+on:
+  workflow_dispatch:
+    inputs:
+      setup_labels:
+        description: "Crear etiquetas estándar si faltan"
+        type: boolean
+        default: true
+      healthcheck:
+        description: "Ejecutar diagnóstico de tokens y configuración"
+        type: boolean
+        default: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  labels:
+    if: ${{ inputs.setup_labels }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/setup_labels.py
+
+  healthcheck:
+    if: ${{ inputs.healthcheck }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Healthcheck
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python scripts/healthcheck.py
