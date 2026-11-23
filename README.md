@@ -19,6 +19,14 @@ mensaje en este repositorio, etiquetado con `slack`.
   comentarios del bot se filtran en ambas direcciones para evitar bucles.
 - **Comandos desde Slack**: un mensaje con `cierra #12` cierra ese issue y `reabre #12`
   lo reabre (también valen `close`/`reopen`), confirmando el resultado en el hilo.
+- **Anti-duplicados por similitud**: si el mensaje se parece (>80% por defecto,
+  `DEDUP_THRESHOLD`) al título de un issue abierto, se comenta en ese issue en
+  lugar de crear uno nuevo.
+- **Auto-etiquetado por reglas** (sin IA): el texto se clasifica con reglas simples
+  y crea las etiquetas que falten: `bug`, `mejora`, `pregunta`, `prioridad:alta`.
+- **Auto-cierre de inactivos**: los issues creados por el bot sin actividad desde
+  hace 30 dias (`STALE_DAYS`) reciben un aviso y se cierran 7 dias después
+  (`STALE_CLOSE_DAYS`) si nadie responde.
 - Deduplica tres veces: ventana del checkpoint, marcador oculto
   `[slack-ts:<ts>]` buscado contra los issues existentes, y el checkpoint solo
   se avanza cuando los mensajes ya se procesaron.
@@ -54,6 +62,8 @@ Mientras el secret no exista, el workflow termina sin error ni efecto.
 | `SLACK_CHANNEL_NAME` | `general` |
 | `ISSUE_LABELS` | `slack` |
 | `KEYWORDS` | vacío (todos los mensajes) |
+| `DEDUP_THRESHOLD` | `0.8` (similitud título) |
+| `STALE_DAYS` / `STALE_CLOSE_DAYS` | `30` / `7` (`STALE_DAYS=0` lo desactiva) |
 | `THREADS_FILE` | `.slack-state/threads.json` (mapa issue ↔ hilo) |
 
 Si algún efecto secundario de Slack falla (por ejemplo, falta un scope), el

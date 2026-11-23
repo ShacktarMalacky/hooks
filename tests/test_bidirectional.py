@@ -173,7 +173,9 @@ class FullFlowBidirectionalTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             with mock.patch.object(s2i, "slack_get", return_value=messages), \
                     mock.patch.object(s2i, "resolve_author", return_value="Ana"), \
+                    mock.patch.object(s2i, "parse_command", side_effect=s2i.parse_command), \
                     mock.patch.object(s2i, "apply_command", return_value=True) as patch_cmd, \
+                    mock.patch.object(s2i, "manage_stale", return_value=False), \
                     mock.patch.object(s2i, "create_issue") as patch_create, \
                     mock.patch.object(s2i, "sync_thread_replies", return_value=False), \
                     mock.patch.object(s2i, "sync_issue_comments", return_value=False):
@@ -204,6 +206,9 @@ class FullFlowBidirectionalTests(unittest.TestCase):
             with mock.patch.object(s2i, "slack_get", return_value=messages), \
                     mock.patch.object(s2i, "resolve_author", return_value="Ana"), \
                     mock.patch.object(s2i, "issue_exists", return_value=False), \
+                    mock.patch.object(s2i, "find_similar_issue", return_value=None), \
+                    mock.patch.object(s2i, "ensure_labels", return_value=None), \
+                    mock.patch.object(s2i, "manage_stale", return_value=False), \
                     mock.patch.object(s2i, "create_issue", return_value=issue), \
                     mock.patch.object(s2i, "notify_issue_created") as patch_notify, \
                     mock.patch.object(s2i, "sync_thread_replies", return_value=False), \

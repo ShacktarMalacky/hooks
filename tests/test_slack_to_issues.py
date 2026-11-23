@@ -112,6 +112,12 @@ class MainFlowTests(unittest.TestCase):
                 stack.enter_context(
                     mock.patch.object(s2i, "issue_exists", return_value=False)
                 )
+                stack.enter_context(
+                    mock.patch.object(s2i, "find_similar_issue", return_value=None)
+                )
+                stack.enter_context(
+                    mock.patch.object(s2i, "ensure_labels", return_value=None)
+                )
                 create = stack.enter_context(
                     mock.patch.object(
                         s2i,
@@ -159,6 +165,8 @@ class MainFlowTests(unittest.TestCase):
                 s2i, "resolve_author", return_value="A"
             ), mock.patch.object(s2i, "issue_exists", return_value=True), mock.patch.object(
                 s2i, "parse_command", return_value=None
+            ), mock.patch.object(
+                s2i, "manage_stale", return_value=False
             ), mock.patch.object(
                 s2i, "create_issue"
             ) as create, mock.patch.object(

@@ -10,20 +10,32 @@ Features:
 - Bot comments are filtered out on both sides so the sync cannot loop.
 """
 
+import difflib
 import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from datetime import timedelta
 
 SLACK_API = "https://slack.com/api"
 GITHUB_API = "https://api.github.com"
 
 MAX_TITLE_LENGTH = 70
 REACTION_EMOJI = "white_check_mark"
+DEFAULT_SIMILARITY_THRESHOLD = 0.8
+DEFAULT_STALE_DAYS = 30
+DEFAULT_STALE_CLOSE_DAYS = 7
+CLASSIFY_RULES = [
+    ("prioridad:alta", r"urgente|critico|production|no funciona nada|lo antes posible|caida"),
+    ("bug", r"\berror\b|excepcion|crash|\bfallo\b|\bbug\b|no funciona|se rompe|explota"),
+    ("mejora", r"\bmejora\b|sugerencia|seria posible|podriamos|\bagregar\b|\banadir\b|\bseria bueno\b"),
+    ("pregunta", r"\?|\bcómo\b|como hago|que pasa si|\bse puede\b"),
+]
 COMMAND_RE = re.compile(
     r"\b(cierra|cerrar|close|reabre|reabrir|reopen)\s*#\s*(\d+)\b|\b(cierra|cerrar|close|reabre|reabrir|reopen)\s+(\d+)\b",
     re.IGNORECASE,
@@ -134,6 +146,47 @@ def resolve_author(token, user_id):
         return user_id
 
 
+def normalize_text(text):
+    decomposed = unicodedata.normalize("NFD", (text or "").lower())
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def classify(text):
+    normalized = normalize_text(text)
+    labels = []
+    for label, pattern in CLASSIFY_RULES:
+        if re.search(pattern, normalized):
+            labels.append(label)
+    return labels
+
+
+def fetch_open_issues(repo, token):
+    return http_json(
+        f"{GITHUB_API}/repos/{repo}/issues?state=open&per_page=100&sort=updated",
+        token=token,
+    )
+
+
+def find_similar_issue(repo, token, text, threshold):
+    candidate = normalize_text(text)
+    try:
+        open_issues = fetch_open_issues(repo, token)
+    except Exception as error:
+        print(f"  aviso: no se pudieron leer issues abiertos para comparar: {error}")
+        return None
+    best = None
+    best_ratio = 0.0
+    for issue in open_issues:
+        if issue.get("pull_request"):
+            continue
+        ratio = difflib.SequenceMatcher(
+            None, candidate, normalize_text(issue.get("title", ""))
+        ).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = issue, ratio
+    return best if best_ratio >= threshold else None
+
+
 def issue_exists(repo, token, ts):
     query = urllib.parse.quote(f'repo:{repo} is:issue "slack-ts:{ts}"')
     result = http_json(f"{GITHUB_API}/search/issues?q={query}&per_page=1", token=token)
@@ -165,6 +218,88 @@ def gh_set_issue_state(repo, token, number, state):
         token=token,
         body={"state": state},
     )
+
+
+def ensure_labels(repo, token, labels):
+    if not labels:
+        return
+    try:
+        existing = {
+            label["name"]
+            for label in http_json(
+                f"{GITHUB_API}/repos/{repo}/labels?per_page=100", token=token
+            )
+        }
+    except Exception as error:
+        print(f"  aviso: no se pudieron leer las etiquetas: {error}")
+        return
+    for label in labels:
+        if label in existing:
+            continue
+        try:
+            http_json(
+                f"{GITHUB_API}/repos/{repo}/labels",
+                method="POST",
+                token=token,
+                body={"name": label},
+            )
+        except Exception as error:
+            print(f"  aviso: no se pudo crear la etiqueta '{label}': {error}")
+
+
+def find_warn_date(comments):
+    dates = re.findall(r"\[stale:(\d{4}-\d{2}-\d{2})\]", "".join(
+        comment.get("body", "") for comment in comments
+    ))
+    if not dates:
+        return None
+    return max(datetime.strptime(date, "%Y-%m-%d") for date in dates)
+
+
+def manage_stale(repo, token, stale_days, close_days, now=None):
+    now = now or datetime.now(timezone.utc)
+    changed = False
+    try:
+        open_issues = fetch_open_issues(repo, token)
+    except Exception as error:
+        print(f"  aviso: no se pudieron revisar issues inactivos: {error}")
+        return False
+    for issue in open_issues:
+        if issue.get("pull_request"):
+            continue
+        body = issue.get("body") or ""
+        if "slack-ts:" not in body and "notion-row:" not in body:
+            continue
+        try:
+            updated = datetime.fromisoformat(issue["updated_at"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        if now - updated < timedelta(days=stale_days):
+            continue
+        comments = http_json(
+            f"{GITHUB_API}/repos/{repo}/issues/{issue['number']}/comments?per_page=100",
+            token=token,
+        )
+        warn_date = find_warn_date(comments)
+        if warn_date is None:
+            today = now.strftime("%Y-%m-%d")
+            gh_add_comment(
+                repo,
+                token,
+                issue["number"],
+                (
+                    f":warning: Sin actividad desde hace {stale_days} dias. "
+                    f"Se cerrara automaticamente en {close_days} dias si nadie "
+                    f"responde. Responde para conservarlo. [stale:{today}]"
+                ),
+            )
+            print(f"  issue #{issue['number']}: aviso de inactividad")
+            changed = True
+        elif now - warn_date.replace(tzinfo=timezone.utc) > timedelta(days=close_days):
+            gh_set_issue_state(repo, token, issue["number"], "close")
+            print(f"  issue #{issue['number']}: cerrado por inactividad")
+            changed = True
+    return changed
 
 
 def parse_command(text):
@@ -336,6 +471,15 @@ def main():
     state_file = os.environ.get("THREADS_FILE", ".slack-state/threads.json")
     labels = [label for label in os.environ.get("ISSUE_LABELS", "slack").split(",") if label]
     keywords = [kw.strip() for kw in os.environ.get("KEYWORDS", "").split(",") if kw.strip()]
+    try:
+        similarity_threshold = float(os.environ.get("DEDUP_THRESHOLD", DEFAULT_SIMILARITY_THRESHOLD))
+    except ValueError:
+        similarity_threshold = DEFAULT_SIMILARITY_THRESHOLD
+    try:
+        stale_days = int(os.environ.get("STALE_DAYS", DEFAULT_STALE_DAYS))
+        stale_close_days = int(os.environ.get("STALE_CLOSE_DAYS", DEFAULT_STALE_CLOSE_DAYS))
+    except ValueError:
+        stale_days, stale_close_days = DEFAULT_STALE_DAYS, DEFAULT_STALE_CLOSE_DAYS
 
     state = load_state(state_file)
     oldest = load_checkpoint(checkpoint_file)
@@ -369,17 +513,39 @@ def main():
             print(f"- {ts}: ya tiene un issue, se omite")
         else:
             author = resolve_author(slack_token, message.get("user"))
-            title = make_title(text)
-            body = format_issue_body(message, author, channel_id, channel_name)
-            issue = create_issue(repo, github_token, title, body, labels)
-            print(f"- {ts}: issue creado -> {issue.get('html_url')}")
-            created += 1
-            notify_issue_created(slack_token, channel_id, ts, issue)
-            state["issues"][str(issue.get("number"))] = {"ts": ts, "channel": channel_id}
+            similar = find_similar_issue(repo, github_token, make_title(text), similarity_threshold)
+            if similar:
+                print(
+                    f"- {ts}: similar al issue #{similar['number']} "
+                    f"({similar.get('title', '')!r}); se comenta en lugar de crear uno"
+                )
+                try:
+                    gh_add_comment(
+                        repo,
+                        github_token,
+                        similar["number"],
+                        f"**{author} (Slack):**\n\n{quote_text(text)}\n\n"
+                        f"Mensaje repetido desde Slack. [slack-ts:{ts}]",
+                    )
+                except Exception as error:
+                    print(f"  aviso: no se pudo comentar el duplicado: {error}")
+            else:
+                title = make_title(text)
+                body = format_issue_body(message, author, channel_id, channel_name)
+                issue_labels = labels + [label for label in classify(text) if label not in labels]
+                ensure_labels(repo, github_token, issue_labels)
+                issue = create_issue(repo, github_token, title, body, issue_labels)
+                print(f"- {ts}: issue creado -> {issue.get('html_url')}")
+                created += 1
+                notify_issue_created(slack_token, channel_id, ts, issue)
+                state["issues"][str(issue.get("number"))] = {"ts": ts, "channel": channel_id}
         newest_ts = ts
 
     changed = sync_thread_replies(state, repo, github_token, slack_token, channel_id)
     changed = sync_issue_comments(state, repo, github_token, slack_token, channel_id) or changed
+
+    if stale_days > 0:
+        changed = manage_stale(repo, github_token, stale_days, stale_close_days) or changed
 
     if newest_ts != oldest:
         save_checkpoint(checkpoint_file, newest_ts)
