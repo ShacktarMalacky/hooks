@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Create GitHub issues from new Slack messages in a configured channel.
+"""Create GitHub issues from new Slack messages and keep both sides in sync.
 
-Reads new top-level human messages from a Slack channel, creates one GitHub
-issue per message, and advances a checkpoint file so the next run only sees
-messages posted afterwards. Deduplication is layered: the checkpoint plus a
-hidden `slack-ts` marker searched against existing issues.
+Features:
+- New top-level human messages in a Slack channel become GitHub issues.
+- On creation, the bot reacts to the message and replies in the thread with
+  the issue link.
+- Thread replies become issue comments; issue comments become thread replies.
+- Slack control commands `cierra #N` / `reabre #N` close or reopen issues.
+- Bot comments are filtered out on both sides so the sync cannot loop.
 """
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -19,6 +23,12 @@ SLACK_API = "https://slack.com/api"
 GITHUB_API = "https://api.github.com"
 
 MAX_TITLE_LENGTH = 70
+REACTION_EMOJI = "white_check_mark"
+COMMAND_RE = re.compile(
+    r"\b(cierra|cerrar|close|reabre|reabrir|reopen)\s*#\s*(\d+)\b|\b(cierra|cerrar|close|reabre|reabrir|reopen)\s+(\d+)\b",
+    re.IGNORECASE,
+)
+CLOSE_WORDS = ("cierra", "cerrar", "close")
 
 
 def http_json(url, method="GET", token=None, body=None, headers=None):
@@ -44,6 +54,28 @@ def slack_get(method, token, **params):
     result = http_json(f"{SLACK_API}/{method}?{query}", token=token)
     if not result.get("ok"):
         raise RuntimeError(f"Slack API {method} failed: {result.get('error')}")
+    return result
+
+
+def slack_post(token, channel, text, thread_ts=None):
+    body = {"channel": channel, "text": text}
+    if thread_ts:
+        body["thread_ts"] = thread_ts
+    result = http_json(f"{SLACK_API}/chat.postMessage", method="POST", token=token, body=body)
+    if not result.get("ok"):
+        raise RuntimeError(f"Slack API chat.postMessage failed: {result.get('error')}")
+    return result
+
+
+def slack_react(token, channel, ts, name):
+    result = http_json(
+        f"{SLACK_API}/reactions.add",
+        method="POST",
+        token=token,
+        body={"channel": channel, "timestamp": ts, "name": name},
+    )
+    if not result.get("ok"):
+        raise RuntimeError(f"Slack API reactions.add failed: {result.get('error')}")
     return result
 
 
@@ -87,6 +119,10 @@ def format_issue_body(message, author, channel_id, channel_name):
     )
 
 
+def quote_text(text):
+    return "\n".join(f"> {line}" for line in text.splitlines())
+
+
 def resolve_author(token, user_id):
     if not user_id:
         return "desconocido"
@@ -113,6 +149,34 @@ def create_issue(repo, token, title, body, labels):
     )
 
 
+def gh_add_comment(repo, token, number, body):
+    return http_json(
+        f"{GITHUB_API}/repos/{repo}/issues/{number}/comments",
+        method="POST",
+        token=token,
+        body={"body": body},
+    )
+
+
+def gh_set_issue_state(repo, token, number, state):
+    return http_json(
+        f"{GITHUB_API}/repos/{repo}/issues/{number}",
+        method="PATCH",
+        token=token,
+        body={"state": state},
+    )
+
+
+def parse_command(text):
+    match = COMMAND_RE.search(text or "")
+    if not match:
+        return None
+    word = match.group(1) or match.group(3)
+    number = match.group(2) or match.group(4)
+    action = "close" if word.lower() in CLOSE_WORDS else "open"
+    return action, int(number)
+
+
 def load_checkpoint(path):
     try:
         with open(path, encoding="utf-8") as handle:
@@ -127,11 +191,141 @@ def save_checkpoint(path, ts):
         handle.write("\n")
 
 
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = {}
+    state.setdefault("issues", {})
+    state.setdefault("replies", {})
+    state.setdefault("comments", {})
+    return state
+
+
+def save_state(path, state):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+        handle.write("\n")
+
+
+def notify_issue_created(slack_token, channel_id, ts, issue):
+    number = issue.get("number", "?")
+    link = issue.get("html_url", "")
+    title = issue.get("title", "")
+    try:
+        slack_react(slack_token, channel_id, ts, REACTION_EMOJI)
+    except Exception as error:
+        print(f"  aviso: no se pudo reaccionar al mensaje: {error}")
+    try:
+        slack_post(
+            slack_token,
+            channel_id,
+            f":white_check_mark: Issue creado: #{number} — {title}\n{link}",
+            thread_ts=ts,
+        )
+    except Exception as error:
+        print(f"  aviso: no se pudo responder en el hilo: {error}")
+
+
+def apply_command(action, number, author, repo, token, slack_token, channel_id, ts):
+    state_label = "cerrado" if action == "close" else "reabierto"
+    try:
+        gh_set_issue_state(repo, token, number, action)
+    except Exception as error:
+        print(f"- {ts}: falló {state_label} #{number}: {error}")
+        return False
+    try:
+        slack_post(
+            slack_token,
+            channel_id,
+            f":white_check_mark: Issue #{number} {state_label} por {author}",
+            thread_ts=ts,
+        )
+    except Exception as error:
+        print(f"  aviso: no se pudo confirmar en Slack: {error}")
+    return True
+
+
+def sync_thread_replies(state, repo, github_token, slack_token, channel_id):
+    changed = False
+    for number, info in sorted(state["issues"].items(), key=lambda item: float(item[1]["ts"])):
+        last = state["replies"].get(number, info["ts"])
+        try:
+            replies = slack_get(
+                "conversations.replies",
+                slack_token,
+                channel=info.get("channel", channel_id),
+                ts=info["ts"],
+                oldest=last,
+                limit=200,
+            ).get("messages", [])
+        except Exception as error:
+            print(f"  aviso: no se pudo leer el hilo del issue #{number}: {error}")
+            continue
+        for reply in sorted(replies, key=lambda message: float(message.get("ts", "0"))):
+            ts = reply.get("ts", last)
+            if ts == info["ts"]:
+                last = ts
+                continue
+            if is_issue_worthy(reply):
+                author = resolve_author(slack_token, reply.get("user"))
+                body = f"**{author} (Slack):**\n\n{quote_text(reply['text'])}"
+                try:
+                    gh_add_comment(repo, github_token, int(number), body)
+                    print(f"  hilo -> issue #{number}: comentario de {author}")
+                except Exception as error:
+                    print(f"  aviso: no se pudo comentar en el issue #{number}: {error}")
+            last = max(last, ts, key=float)
+            changed = True
+        if replies:
+            state["replies"][number] = last
+    return changed
+
+
+def sync_issue_comments(state, repo, github_token, slack_token, channel_id):
+    changed = False
+    for number, info in sorted(state["issues"].items(), key=lambda item: float(item[1]["ts"])):
+        last = state["comments"].get(number, 0)
+        try:
+            comments = http_json(
+                f"{GITHUB_API}/repos/{repo}/issues/{number}/comments?sort=created&direction=asc&per_page=100",
+                token=github_token,
+            )
+        except Exception as error:
+            print(f"  aviso: no se pudieron leer los comentarios del issue #{number}: {error}")
+            continue
+        for comment in comments:
+            if comment["id"] <= last:
+                continue
+            user = comment.get("user") or {}
+            if user.get("type") == "Bot" or str(user.get("login", "")).endswith("[bot]"):
+                last = max(last, comment["id"])
+                changed = True
+                continue
+            author = user.get("login", "desconocido")
+            try:
+                slack_post(
+                    slack_token,
+                    info.get("channel", channel_id),
+                    f":speech_balloon: *{author}* comentó en #{number}:\n{quote_text(comment.get('body', ''))}",
+                    thread_ts=info["ts"],
+                )
+                print(f"  issue #{number} -> hilo: comentario de {author}")
+            except Exception as error:
+                print(f"  aviso: no se pudo avisar al hilo del issue #{number}: {error}")
+            last = max(last, comment["id"])
+            changed = True
+        if comments:
+            state["comments"][number] = last
+    return changed
+
+
 def main():
     slack_token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
     if not slack_token:
         print("WARNING: SLACK_BOT_TOKEN no esta configurado; no se hace nada.")
-        print("Configura el secret y ejecuta el workflow manualmente para probar.")
+        print("Configura el token en el repo y ejecuta el workflow manualmente para probar.")
         return 0
 
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -139,9 +333,11 @@ def main():
     channel_id = os.environ["SLACK_CHANNEL_ID"]
     channel_name = os.environ.get("SLACK_CHANNEL_NAME", "general")
     checkpoint_file = os.environ.get("CHECKPOINT_FILE", ".slack-state/checkpoint.json")
+    state_file = os.environ.get("THREADS_FILE", ".slack-state/threads.json")
     labels = [label for label in os.environ.get("ISSUE_LABELS", "slack").split(",") if label]
     keywords = [kw.strip() for kw in os.environ.get("KEYWORDS", "").split(",") if kw.strip()]
 
+    state = load_state(state_file)
     oldest = load_checkpoint(checkpoint_file)
     history = slack_get(
         "conversations.history",
@@ -162,10 +358,14 @@ def main():
     for message in messages:
         ts = message["ts"]
         text = message["text"]
-        if not matches_keywords(text, keywords):
+        command = parse_command(text)
+        if command:
+            action, number = command
+            author = resolve_author(slack_token, message.get("user"))
+            apply_command(action, number, author, repo, github_token, slack_token, channel_id, ts)
+        elif not matches_keywords(text, keywords):
             print(f"- {ts}: omitido por filtro de palabras clave")
-            continue
-        if issue_exists(repo, github_token, ts):
+        elif issue_exists(repo, github_token, ts):
             print(f"- {ts}: ya tiene un issue, se omite")
         else:
             author = resolve_author(slack_token, message.get("user"))
@@ -174,11 +374,18 @@ def main():
             issue = create_issue(repo, github_token, title, body, labels)
             print(f"- {ts}: issue creado -> {issue.get('html_url')}")
             created += 1
+            notify_issue_created(slack_token, channel_id, ts, issue)
+            state["issues"][str(issue.get("number"))] = {"ts": ts, "channel": channel_id}
         newest_ts = ts
+
+    changed = sync_thread_replies(state, repo, github_token, slack_token, channel_id)
+    changed = sync_issue_comments(state, repo, github_token, slack_token, channel_id) or changed
 
     if newest_ts != oldest:
         save_checkpoint(checkpoint_file, newest_ts)
         print(f"Checkpoint actualizado a {newest_ts}")
+    if created or changed:
+        save_state(state_file, state)
     print(f"Issues creados: {created}")
     return 0
 
